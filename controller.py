@@ -61,7 +61,7 @@ class UniversalEEGCommandExecutor:
                 "key": "space",
                 "type": "hold",  # "press", "hold", "toggle"
                 "enabled": True,
-                "min_strength": 0.6,  # Increased threshold for stability
+                "min_strength": 0.3,  # Lowered for easier triggering
                 "description": "Hold SPACE while focusing"
             },
             "Relax": {
@@ -127,7 +127,7 @@ class UniversalEEGCommandExecutor:
         # Add calibration and user adaptation
         self.calibration_mode = False
         self.calibration_data = {"focus": [], "relax": [], "neutral": []}
-        self.user_thresholds = {"focus_beta": 0.5, "relax_alpha": 0.3}  # Will be updated during calibration
+        self.user_thresholds = {"focus_beta": 0.3, "relax_alpha": 0.3}  # Will be updated during calibration
         
         # Real-time performance tracking
         self.detection_accuracy = {"focus": 0.8, "relax": 0.8, "blink": 0.7}
@@ -455,7 +455,7 @@ class UniversalEEGCommandExecutor:
             return "Neutral", 0.1
         
         # Focus detection with immediate key handling
-        if beta_avg > alpha_avg * 1.3 and beta_avg > 0.5:
+        if beta_avg > alpha_avg * 1.1 and beta_avg > 0.3:
             strength = min(beta_avg / (alpha_avg + beta_avg), 1.0)
             return "Focus", strength
         
@@ -872,6 +872,24 @@ class UniversalEEGCommandExecutor:
             print("\nStarting in 3 seconds...")
             time.sleep(3)
             self.calibrate_blink()
+        elif event.key == pygame.K_c:
+            def run_calibration():
+                print("\n=== MENTAL STATE CALIBRATION ===")
+                print("Step 1/2: FOCUS state")
+                print("Concentrate hard — solve a math problem, count backwards, etc.")
+                print("Starting in 3 seconds...")
+                time.sleep(3)
+                self.start_calibration("focus", duration=10)
+                print("\nStep 2/2: RELAX state")
+                print("Close your eyes, breathe slowly, clear your mind.")
+                print("Starting in 3 seconds...")
+                time.sleep(3)
+                self.start_calibration("relax", duration=10)
+                print("\n✅ Calibration complete! Adaptive thresholds now active.")
+                print(f"   Focus β floor: {self.user_thresholds['focus_beta']:.3f}")
+                print(f"   Relax α floor: {self.user_thresholds['relax_alpha']:.3f}")
+            import threading as _threading
+            _threading.Thread(target=run_calibration, daemon=True).start()
         elif event.key == pygame.K_UP:
             self.adjust_sensitivity(increase=True)
         elif event.key == pygame.K_DOWN:
@@ -935,7 +953,7 @@ class UniversalEEGCommandExecutor:
             return "Neutral", 0.1
         
         # Adaptive Focus detection using calibrated threshold
-        if beta_avg > alpha_avg * 1.3 and beta_avg > focus_threshold:
+        if beta_avg > alpha_avg * 1.1 and beta_avg > focus_threshold:
             strength = min(beta_avg / (alpha_avg + beta_avg), 1.0)
             return "Focus", strength
         
