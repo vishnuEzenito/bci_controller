@@ -248,7 +248,11 @@ class UniversalEEGCommandExecutor:
         idx = np.logical_and(f >= band[0], f <= band[1])
         if np.sum(idx) == 0:
             return 0
-        return np.trapz(psd[idx], f[idx])
+        # Use trapezoid for numpy 2.0+ (trapz was deprecated)
+        try:
+            return np.trapezoid(psd[idx], f[idx])
+        except AttributeError:
+            return np.trapz(psd[idx], f[idx])
 
     def calculate_signal_quality(self, data):
         try:
