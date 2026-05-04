@@ -93,7 +93,12 @@ def _apply_filter(b, a, data):
 
 def _bandpower(freqs, psd, low, high):
     idx = np.where((freqs >= low) & (freqs <= high))[0]
-    return float(np.trapz(psd[idx], freqs[idx])) if idx.size > 1 else 0.0
+    if idx.size > 1:
+        try:
+            return float(np.trapezoid(psd[idx], freqs[idx]))
+        except AttributeError:
+            return float(np.trapz(psd[idx], freqs[idx]))
+    return 0.0
 
 
 def _robust_welch(signal, fs):
