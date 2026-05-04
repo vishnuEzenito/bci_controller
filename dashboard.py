@@ -71,10 +71,11 @@ def _init_gui():
     global screen, FONT, SMALL, TITLE, TINY, BIG, W, H
     import pygame
     pygame.init()
-    info  = pygame.display.Info()
-    W, H  = info.current_w, info.current_h
-    # FULLSCREEN hides the Dock and menu bar, giving the full pixel area.
-    screen = pygame.display.set_mode((W, H), pygame.FULLSCREEN)
+    # Pass (0, 0) so pygame picks the native display resolution automatically.
+    # Querying display.Info() *before* set_mode can return wrong values on
+    # HiDPI / scaled displays, causing content to be cropped in fullscreen.
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+    W, H   = screen.get_width(), screen.get_height()
     pygame.display.set_caption("EEG Dashboard")
     s = H / 900
     BIG   = _sysfont(int(54 * s), bold=True)
