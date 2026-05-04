@@ -139,11 +139,17 @@ class FocusProcessor:
                               → F_total = 0.7·F + 0.3·stability_norm
     """
 
-    STABILITY_WINDOW = int(3 * SRATE)   # 3-sec variance window
-    STABILITY_K = 5.0                   # normalization scale
+    # F history for stability (3 sec at ~30 fps tick rate)
+    F_HISTORY_LEN = 90
+    STABILITY_K   = 200.0   # tuned for var(F∈[0,1]): var≈0.005→stable, var≈0.05→jittery
+
+    # EMA smoothing on F before exposing as Current Strength
+    F_EMA_ALPHA = 0.15
 
     def __init__(self):
-        self.buffer = deque(maxlen=BUFFER_LEN)   # (fp1, fp2) tuples
+        self.buffer    = deque(maxlen=BUFFER_LEN)   # (fp1, fp2) tuples
+        self.F_history = deque(maxlen=self.F_HISTORY_LEN)  # for stability variance
+        self._F_ema    = 0.3                                # smoothed current strength
 
     def push(self, fp1: float, fp2: float):
         self.buffer.append((fp1, fp2))
@@ -162,25 +168,28 @@ class FocusProcessor:
         beta  = (bp1["beta"]  + bp2["beta"])  / 2
         theta = (bp1["theta"] + bp2["theta"]) / 2
 
-        # Raw focus: engagement index
-        F = beta / (alpha + theta + EPS)
-        F = float(np.clip(F, 0, 1))
+        # Raw focus: engagement index β/(α+θ)
+        F_raw = beta / (alpha + theta + EPS)
+        F_raw = float(np.clip(F_raw, 0, 1))
 
-        # Stability: inverse variance of F over last 3 sec
-        recent_len = min(self.STABILITY_WINDOW, len(self.buffer))
-        recent = np.array(list(self.buffer)[-recent_len:], dtype=np.float32)
-        fp1_r, fp2_r = recent[:, 0], recent[:, 1]
-        bp1r = extract_band_powers(fp1_r)
-        bp2r = extract_band_powers(fp2_r)
-        beta_r = (bp1r["beta"] + bp2r["beta"]) / 2
-        alpha_r = (bp1r["alpha"] + bp2r["alpha"]) / 2
-        theta_r = (bp1r["theta"] + bp2r["theta"]) / 2
-        F_hist_proxy = beta_r / (alpha_r + theta_r + EPS)
-        variance = float(np.var(recent[:, 0]))   # FP1 amplitude variance
+        # EMA smoothing — spec: S_t = α·P_t + (1-α)·S_{t-1}
+        self._F_ema = self.F_EMA_ALPHA * F_raw + (1 - self.F_EMA_ALPHA) * self._F_ema
+        F = float(self._F_ema)
+
+        # Stability — spec: σ² = var(S over 3s), Stability = 1 - k·σ²
+        # Use var(F history) — focus signal variance, NOT raw EEG amplitude
+        self.F_history.append(F)
+        if len(self.F_history) >= 5:
+            variance = float(np.var(np.array(self.F_history)))
+        else:
+            variance = 0.05   # assume jittery until enough history
         stability = 1.0 / (variance + EPS)
         stability_norm = float(np.clip(stability / self.STABILITY_K, 0, 1))
 
-        F_total = 0.7 * F + 0.3 * stability_norm
+        # stability_norm is used only for scoring/flow — not baked into F_total
+        # (including it here creates a constant upward bias that moves the ball
+        #  even during neutral since stable signals always have high stability_norm)
+        F_total = F
 
         # FAA stress (for display only)
         faa = math.log(bp2["alpha"] + EPS) - math.log(bp1["alpha"] + EPS)
@@ -228,8 +237,9 @@ class FocusGameEngine:
     SPIKE_PENALTY = 0.9
     SPIKE_THRESHOLD = 0.35       # absolute jump in F_total in one tick
 
-    # Flow
-    FLOW_ONSET_SEC = 1.0         # must be above θ this long to enter flow
+    # Flow — spec requires BOTH strength AND stability above threshold
+    FLOW_ONSET_SEC      = 1.0    # must be above θ this long to enter flow
+    FLOW_STABILITY_MIN  = 0.25   # minimum stability_norm to count toward flow
 
     # Difficulty adaptation
     PERCENTILE_CLAMP = (60, 80)
@@ -264,6 +274,10 @@ class FocusGameEngine:
         self.score = 0.0
         self.prev_strength = 0.0
         self.prev_F_total = 0.0
+
+        # True velocity: smoothed dS/dt  (spec: V_t = (S_t - S_{t-Δt}) / Δt)
+        self.strength_velocity: float = 0.0
+        self._prev_strength_raw: float = 0.0
 
         # Flow
         self.flow_active = False
@@ -385,8 +399,10 @@ class FocusGameEngine:
         Z = self._normalize(F_total)
         y = self._map(Z)
 
-        # Physics
-        self.velocity = self.GAMMA * self.velocity + (1 - self.GAMMA) * y
+        # Physics — weak spring pulls position back toward centre (0.5)
+        # prevents ball from coasting indefinitely when signal returns to neutral
+        spring = -0.3 * (self.position - 0.5)
+        self.velocity = self.GAMMA * self.velocity + (1 - self.GAMMA) * (y + spring)
         self.position = self.position + self.velocity * dt   # unbounded
 
         # Charge (effort accumulation)
@@ -403,13 +419,18 @@ class FocusGameEngine:
         if len(self.strength_30s) == self.strength_30s.maxlen:
             self._update_difficulty()
 
-        # ── Flow state ────────────────────────────────────────────────────────
-        if strength > effective_theta:
+        # Velocity: smoothed first derivative of strength (spec: V_t = dS/dt)
+        raw_vel = (strength - self._prev_strength_raw) / dt
+        self.strength_velocity = 0.7 * self.strength_velocity + 0.3 * raw_vel
+        self._prev_strength_raw = strength
+
+        # ── Flow state — spec: strength > T_strength AND stability > T_stability ──
+        in_flow_zone = strength > effective_theta and stab >= self.FLOW_STABILITY_MIN
+        if in_flow_zone:
             self.flow_timer += dt
             self.flow_strength_acc.append(strength - effective_theta)
         else:
             if self.flow_active:
-                # leaving flow
                 self.longest_flow = max(self.longest_flow, self.flow_timer)
                 self.flow_active = False
                 self.flow_timer = 0.0
@@ -477,6 +498,7 @@ class FocusGameEngine:
             "longest_flow": self.longest_flow,
             "flow_entries": self.flow_entries,
             "score": self.score,
+            "strength_velocity": self.strength_velocity,
             "alpha_gain": self.alpha_gain,
             "target_percentile": self.target_percentile,
             "faa_stress": features.get("faa_stress", 0.5),
@@ -669,6 +691,8 @@ class FocusGame:
         self._ball_angle: float = 0.0
         self._grid_surf: pygame.Surface | None = None
         self._paused = False
+        self._pause_rect: pygame.Rect | None = None
+        self._tick: int = 0          # incremented each drawn frame, used for sparks
 
     # ── grid (built once) ────────────────────────────────────────────────────
 
@@ -700,11 +724,11 @@ class FocusGame:
         """Ball is always drawn at this fixed vertical centre on screen."""
         return int(self.H * 0.42)
 
-    def _get_wave_ys(self) -> tuple[np.ndarray, np.ndarray]:
+    def _get_wave_ys(self, sigma: float = 10) -> tuple[np.ndarray, np.ndarray]:
         """
         Camera-relative trail: ball stays fixed at _ball_screen_y().
         Trail points are offset from ball by (current_pos - point_pos) * scale_px.
-        Positive offset → point was lower than ball → drawn below ball. ✓
+        sigma controls gaussian smoothing — lower = more data oscillation visible.
         """
         ball_x  = int(self.W * self.BALL_X_FRAC)
         ball_sy = self._ball_screen_y()
@@ -725,10 +749,9 @@ class FocusGame:
         src = np.linspace(0, 1, self.WAVE_LEN, dtype=np.float32)
         dst = np.linspace(0, 1, ball_x, dtype=np.float32)
         trail = np.interp(dst, src, hist).astype(np.float32)
-        trail_smooth = gaussian_filter1d(trail, sigma=10)
+        trail_smooth = gaussian_filter1d(trail, sigma=sigma)
 
         current_pos = float(trail_smooth[-1])
-        # (current - trail[i]) > 0  →  trail point was lower  →  draw below ball
         trail_ys = (ball_sy + (current_pos - trail_smooth) * scale).astype(np.int32)
 
         wave_ys = np.full(self.W, self.H + 10, dtype=np.int32)
@@ -737,74 +760,187 @@ class FocusGame:
 
     # ── trail: glowing line fading old→new ───────────────────────────────────
 
-    def _draw_trail(self, wave_ys: np.ndarray, ball_x: int, flow: bool):
-        """Dim grey (old) → bright white (near ball), with a glow pass."""
+    @staticmethod
+    def _motion_mode(es: dict) -> str:
+        """Return 'flow' | 'rising' | 'falling' | 'neutral'."""
+        if es.get("flow_active", False):
+            return "flow"
+        vel = es.get("strength_velocity", 0.0)
+        if vel > 0.05:
+            return "rising"
+        if vel < -0.05:
+            return "falling"
+        return "neutral"
+
+    def _draw_trail(self, wave_ys: np.ndarray, ball_x: int, mode: str, es: dict):
+        """
+        Physics-aware trail renderer.
+        flow    → rocket booster: thick cyan exhaust, widening near ball, sparks
+        falling → falling comet: red/orange, widens at head (ball), tapers back
+        rising  → slow climb: thin white gradient, quiet
+        neutral → data wave: very thin, let EEG oscillation show through
+        """
         step = 2
         pts = [(x, int(wave_ys[x])) for x in range(0, ball_x, step)]
         n = len(pts)
         if n < 2:
             return
 
-        # First pass: wide soft glow for the newest 30% of trail
-        glow_start = int(n * 0.70)
-        for i in range(glow_start + 1, n):
-            t2 = (i - glow_start) / max(n - glow_start, 1)
-            alpha = int(18 + 30 * t2)
-            w = int(3 + 5 * t2)
-            c = (200, 210, 255, alpha) if not flow else (64, 210, 220, alpha)
-            gs = pygame.Surface((w * 2 + 2, w * 2 + 2), pygame.SRCALPHA)
-            p0 = (pts[i - 1][0] - pts[i][0], pts[i - 1][1] - pts[i][1])
-            p1 = (w + 1, w + 1)
-            p2 = (pts[i][0] - pts[i][0] + w + 1 + (pts[i][0] - pts[i - 1][0]),
-                  pts[i][1] - pts[i][1] + w + 1 + (pts[i][1] - pts[i - 1][1]))
-            pygame.draw.line(gs, c,
-                             (w + 1 + pts[i-1][0] - pts[i][0],
-                              w + 1 + pts[i-1][1] - pts[i][1]),
-                             (w + 1, w + 1), w)
-            self.screen.blit(gs, (pts[i][0] - w - 1, pts[i][1] - w - 1))
+        if mode == "flow":
+            # ── ROCKET BOOSTER ─────────────────────────────────────────
+            # Layer 1: full trail, thin dim cyan
+            for i in range(1, n):
+                t = i / max(n - 1, 1)
+                c = (0, int(80 + 60 * t), int(80 + 80 * t))
+                pygame.draw.line(self.screen, c, pts[i - 1], pts[i], 1)
 
-        # Second pass: crisp line with brightness gradient
-        for i in range(1, n):
-            t = (i / max(n - 1, 1)) ** 1.4   # quadratic: dim→bright
-            brightness = int(35 + 220 * t)
-            blue_boost = min(brightness + 25, 255)
-            w = 2 if t > 0.75 else 1
-            if flow:
-                c = (int(brightness * 0.3), int(brightness * 0.9), blue_boost)
-            else:
-                c = (brightness, brightness, blue_boost)
-            pygame.draw.line(self.screen, c, pts[i - 1], pts[i], w)
+            # Layer 2: last 55%, medium width, brighter cyan
+            s2 = int(n * 0.45)
+            for i in range(s2 + 1, n):
+                t = (i - s2) / max(n - s2, 1)
+                c = (0, int(140 + 84 * t), int(150 + 58 * t))
+                pygame.draw.line(self.screen, c, pts[i - 1], pts[i], 3)
+
+            # Layer 3: last 25%, thick bright white-cyan
+            s3 = int(n * 0.75)
+            for i in range(s3 + 1, n):
+                t = (i - s3) / max(n - s3, 1)
+                r_val = int(180 * t)
+                c = (r_val, int(220 + 35 * t), 255)
+                w = int(5 + 4 * t)   # 5→9px near ball
+                pygame.draw.line(self.screen, c, pts[i - 1], pts[i], w)
+
+            # Spark particles — 8 bright dots in last 18%, positions jittered per tick
+            rng = random.Random(self._tick * 7 + 13)
+            s4 = int(n * 0.82)
+            for _ in range(8):
+                idx = rng.randint(s4, n - 1)
+                px, py = pts[idx]
+                ox = rng.randint(-6, 6)
+                oy = rng.randint(-6, 6)
+                sr = rng.randint(1, 3)
+                alpha = rng.randint(120, 230)
+                sg = pygame.Surface((sr * 2 + 2, sr * 2 + 2), pygame.SRCALPHA)
+                pygame.draw.circle(sg, (255, 255, 255, alpha), (sr + 1, sr + 1), sr)
+                self.screen.blit(sg, (px + ox - sr - 1, py + oy - sr - 1))
+
+        elif mode == "falling":
+            # ── FALLING COMET ──────────────────────────────────────────
+            # Trail widens toward ball (head of comet), tapers to past (tail)
+            # Colours: dark orange (old) → orange → red → bright near ball
+            for i in range(1, n):
+                t = i / max(n - 1, 1)          # 0 = oldest, 1 = newest (ball)
+                w = max(1, int(1 + 6 * (t ** 2)))  # 1px old → 7px near ball
+                # dark orange → red → bright red-white
+                r = min(255, int(120 + 135 * t))
+                g = int(60 * (1 - t) * (1 - t))    # orange tint fades out
+                b = 0
+                pygame.draw.line(self.screen, (r, g, b), pts[i - 1], pts[i], w)
+
+            # Glow halo over last 20%: red-orange smear
+            s2 = int(n * 0.80)
+            for i in range(s2 + 1, n):
+                t2 = (i - s2) / max(n - s2, 1)
+                alpha = int(30 + 40 * t2)
+                gw = int(4 + 8 * t2)
+                gs = pygame.Surface((gw * 2 + 2, gw * 2 + 2), pygame.SRCALPHA)
+                pygame.draw.line(
+                    gs, (255, int(80 * (1 - t2)), 0, alpha),
+                    (gw + 1 + pts[i-1][0] - pts[i][0], gw + 1 + pts[i-1][1] - pts[i][1]),
+                    (gw + 1, gw + 1), gw)
+                self.screen.blit(gs, (pts[i][0] - gw - 1, pts[i][1] - gw - 1))
+
+        elif mode == "rising":
+            # ── SLOW CLIMB ────────────────────────────────────────────
+            # Thin, clean white gradient — understated, signal is recovering
+            for i in range(1, n):
+                t = (i / max(n - 1, 1)) ** 1.6
+                v = int(40 + 200 * t)
+                pygame.draw.line(self.screen, (v, v, min(v + 20, 255)),
+                                 pts[i - 1], pts[i], 1)
+
+        else:
+            # ── NEUTRAL DATA WAVE ──────────────────────────────────────
+            # Very thin, muted — EEG oscillation itself creates the wave shape
+            # (controlled by sigma=4 in _get_wave_ys → data bumps visible)
+            for i in range(1, n):
+                t = (i / max(n - 1, 1)) ** 1.2
+                v = int(25 + 170 * t)
+                pygame.draw.line(self.screen, (v, v, min(v + 15, 255)),
+                                 pts[i - 1], pts[i], 1)
 
     # ── ball ──────────────────────────────────────────────────────────────────
 
-    def _draw_ball(self, wave_ys: np.ndarray, es: dict):
+    def _draw_ball(self, wave_ys: np.ndarray, es: dict, mode: str):
         ball_x = int(self.W * self.BALL_X_FRAC)
-        ball_y = self._ball_screen_y()   # always fixed — camera follows ball
-        flow = es.get("flow_active", False)
+        ball_y = self._ball_screen_y()
         strength = es.get("strength", 0.0)
 
-        self._ball_angle += es.get("velocity", 0.0) * 15.0
+        # Spin speed varies by mode
+        spin_rates = {"flow": 45.0, "falling": 8.0, "rising": 12.0, "neutral": 6.0}
+        self._ball_angle += es.get("velocity", 0.0) * spin_rates.get(mode, 12.0)
 
-        # Outer glow layers
-        glow_color = (64, 224, 208) if flow else (200, 215, 255)
-        for r in range(38, 8, -6):
-            alpha = int(6 + 22 * strength * ((38 - r) / 30))
-            g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-            pygame.draw.circle(g, (*glow_color, alpha), (r, r), r)
-            self.screen.blit(g, (ball_x - r, ball_y - r))
+        if mode == "flow":
+            # ── ROCKET BOOST BALL ─────────────────────────────────────
+            # Pulsing cyan rings — large, intense
+            pulse = 0.5 + 0.5 * math.sin(self._tick * 0.3)   # 0→1 pulse
+            for r in range(60, 8, -6):
+                t = (60 - r) / 52
+                alpha = int((8 + 50 * t) * (0.7 + 0.3 * pulse) * strength)
+                g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(g, (30, int(200 + 55 * t), int(200 + 55 * t), alpha),
+                                   (r, r), r)
+                self.screen.blit(g, (ball_x - r, ball_y - r))
+            # Bright white core
+            pygame.draw.circle(self.screen, (220, 255, 255), (ball_x, ball_y), 14)
+            pygame.draw.circle(self.screen, self.C_WHITE,    (ball_x, ball_y), 10)
 
-        # Solid white ball
-        pygame.draw.circle(self.screen, self.C_WHITE, (ball_x, ball_y), 12)
+        elif mode == "falling":
+            # ── COMET NUCLEUS ─────────────────────────────────────────
+            # Large orange/red halo — comet head
+            for r in range(52, 8, -6):
+                t = (52 - r) / 44
+                alpha = int((10 + 55 * t) * strength)
+                gc = (255, int(120 * (1 - t)), 0, alpha)
+                g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(g, gc, (r, r), r)
+                self.screen.blit(g, (ball_x - r, ball_y - r))
+            # Orange core → white nucleus
+            pygame.draw.circle(self.screen, (255, 140,  40), (ball_x, ball_y), 13)
+            pygame.draw.circle(self.screen, (255, 220, 180), (ball_x, ball_y), 8)
+            pygame.draw.circle(self.screen, self.C_WHITE,    (ball_x, ball_y), 5)
 
-        # Rotating Archimedean spiral etched into the ball
+        elif mode == "rising":
+            # ── SLOW CLIMB BALL ───────────────────────────────────────
+            # Soft white glow, modest size
+            for r in range(32, 8, -6):
+                t = (32 - r) / 24
+                alpha = int((5 + 25 * t) * strength)
+                g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(g, (200, 215, 230, alpha), (r, r), r)
+                self.screen.blit(g, (ball_x - r, ball_y - r))
+            pygame.draw.circle(self.screen, self.C_WHITE, (ball_x, ball_y), 11)
+
+        else:
+            # ── NEUTRAL BALL ──────────────────────────────────────────
+            # Dim white, minimal glow, gentle
+            for r in range(26, 8, -6):
+                t = (26 - r) / 18
+                alpha = int((4 + 18 * t) * max(strength, 0.3))
+                g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(g, (170, 180, 200, alpha), (r, r), r)
+                self.screen.blit(g, (ball_x - r, ball_y - r))
+            pygame.draw.circle(self.screen, (210, 215, 225), (ball_x, ball_y), 11)
+
+        # Spiral etched in ball (all modes)
         spiral_pts = []
         turns, steps, max_r = 1.8, 42, 9
         for i in range(steps + 1):
             t = i / steps
             theta = t * turns * 2 * math.pi + self._ball_angle
-            r = t * max_r
-            spiral_pts.append((int(ball_x + r * math.cos(theta)),
-                                int(ball_y + r * math.sin(theta))))
+            r_sp = t * max_r
+            spiral_pts.append((int(ball_x + r_sp * math.cos(theta)),
+                                int(ball_y + r_sp * math.sin(theta))))
         if len(spiral_pts) > 1:
             pygame.draw.lines(self.screen, self.C_BG, False, spiral_pts, 1)
 
@@ -860,55 +996,111 @@ class FocusGame:
 
         # — LEFT panel —
         lx, ly = left_rect.left + 16, left_rect.top + 12
-
-        # Flow badge chip
+        lw = left_rect.width - 32
         flow_active = es.get("flow_active", False)
-        lf_mins = int(es["longest_flow"]) // 60
-        lf_secs = int(es["longest_flow"]) % 60
-        chip_text = f"LONGEST FLOW:  [duration {lf_mins}:{lf_secs:02d} min]"
+        vel = es.get("strength_velocity", 0.0)
+
+        # ── Row: section label + state tag (right-aligned) ───────────────
+        sec_lbl = self.f_sm.render("FLOW TRACKER", True, self.C_LABEL)
+        self.screen.blit(sec_lbl, (lx, ly))
+
+        # State tag: FOCUSED / RECOVERING / DISTRACTED
+        if flow_active:
+            tag_text, tag_color = "● IN FLOW", (64, 224, 208)
+        elif vel > 0.05:
+            tag_text, tag_color = "▲ RECOVERING", (130, 220, 100)
+        elif vel < -0.05:
+            tag_text, tag_color = "▼ DISTRACTED", (210, 70, 50)
+        else:
+            tag_text, tag_color = "— NEUTRAL", self.C_DIM
+        tag_surf = self.f_sm.render(tag_text, True, tag_color)
+        self.screen.blit(tag_surf, (lx + lw - tag_surf.get_width(), ly))
+        ly += sec_lbl.get_height() + 6
+
+        # Thin separator
+        pygame.draw.line(self.screen, (55, 65, 105),
+                         (lx, ly), (lx + lw, ly), 1)
+        ly += 8
+
+        # LONGEST FLOW chip
+        chip_text = f"{int(es['longest_flow'])}s"
         chip_surf = self.f_lg.render(chip_text, True, self.C_WHITE)
-        chip_bg = pygame.Surface((chip_surf.get_width() + 20, chip_surf.get_height() + 8),
-                                  pygame.SRCALPHA)
-        chip_bg.fill((40, 200, 190, 55) if flow_active else (50, 60, 100, 70))
-        pygame.draw.rect(chip_bg, (64, 224, 208, 90) if flow_active else (80, 95, 150, 60),
-                         chip_bg.get_rect(), 1, border_radius=6)
-        self.screen.blit(chip_bg, (lx, ly))
-        self.screen.blit(chip_surf, (lx + 10, ly + 4))
-        ly += chip_surf.get_height() + 18
+        chip_alpha = pygame.Surface(chip_surf.get_size(), pygame.SRCALPHA)
+        chip_alpha.blit(chip_surf, (0, 0))
+        chip_alpha.set_alpha(155)
+        lf_lbl = self.f_sm.render("LONGEST FLOW", True, self.C_LABEL)
+        self.screen.blit(lf_lbl, (lx, ly))
+        self.screen.blit(chip_alpha, (lx, ly + lf_lbl.get_height() + 2))
 
-        # Strength row
-        self._hud_row(lx, ly, left_rect.width - 32,
-                      "CURRENT STRENGTH:",
-                      f"{strength_int}/100",
-                      strength_int / 100)
-        ly += 46
+        # Strength + Stability stacked on the right half
+        col2_x = lx + lw // 2
+        self._hud_row(col2_x, ly, lw // 2,
+                      "STRENGTH:", f"{strength_int}/100", strength_int / 100)
+        self._hud_row(col2_x, ly + 46, lw // 2,
+                      "STABILITY", f"{es['stability'] * 10:.1f}/10", es["stability"])
 
-        # Stability row
-        self._hud_row(lx, ly, left_rect.width - 32,
-                      "STABILITY",
-                      f"{es['stability'] * 10:.1f}/10.0",
-                      es["stability"])
-
-        # — RIGHT panel —
+        # — RIGHT panel: Calibrative Adaptive —
         rx, ry = right_rect.left + 16, right_rect.top + 12
+        rw = right_rect.width - 32
 
-        phase_names = {1: "Calibrating", 2: "Training", 3: "Peak Phase"}
-        mode_text = f"REINFORCEMENT LEARNING:  [{phase_names.get(es.get('phase', 1), 'V5')} Adaptive]"
-        self.screen.blit(self.f_md.render(mode_text, True, self.C_LABEL), (rx, ry))
-        ry += 32
+        phase = es.get("phase", 1)
+        phase_cfg = {
+            1: ("● CALIBRATING", (217, 160,  30)),
+            2: ("● ADAPTING",    ( 64, 224, 208)),
+            3: ("● PEAK PUSH",   (180, 100, 255)),
+        }
+        phase_label, phase_color = phase_cfg.get(phase, phase_cfg[2])
 
+        # ── Row: section label + phase tag (right-aligned) ──────────────
+        sec_lbl = self.f_sm.render("ADAPTIVE ENGINE", True, self.C_LABEL)
+        self.screen.blit(sec_lbl, (rx, ry))
+        phase_surf = self.f_sm.render(phase_label, True, phase_color)
+        self.screen.blit(phase_surf, (rx + rw - phase_surf.get_width(), ry))
+        ry += sec_lbl.get_height() + 6
+
+        # Thin separator
+        pygame.draw.line(self.screen, (55, 65, 105), (rx, ry), (rx + rw, ry), 1)
+        ry += 8
+
+        # ── Big gain number (left half) + two hud_rows (right half) ─────
+        gain    = es.get("alpha_gain", 1.0)
+        tgt_pct = int(es.get("target_percentile", 65))
+
+        gain_lbl  = self.f_sm.render("SENSITIVITY", True, self.C_LABEL)
+        gain_surf = self.f_lg.render(f"×{gain:.2f}", True, self.C_WHITE)
+        gain_alpha = pygame.Surface(gain_surf.get_size(), pygame.SRCALPHA)
+        gain_alpha.blit(gain_surf, (0, 0))
+        gain_alpha.set_alpha(155)
+        self.screen.blit(gain_lbl,  (rx, ry))
+        self.screen.blit(gain_alpha, (rx, ry + gain_lbl.get_height() + 2))
+
+        col2_x = rx + rw // 2
         top_frac = min(self._top_strength / 200, 1.0)
-        self._hud_row(rx, ry, right_rect.width - 32,
-                      "TOP STRENGTH:",
-                      f"{self._top_strength}/200",
-                      top_frac)
-        ry += 46
+        self._hud_row(col2_x, ry, rw // 2,
+                      "SESSION PEAK:", f"{self._top_strength}/200", top_frac)
 
-        vel = abs(es.get("velocity", 0.0))
-        self._hud_row(rx, ry, right_rect.width - 32,
-                      "VELOCITY",
-                      f"{vel:.2f} u/s",
-                      min(vel * 3, 1.0))
+        vel = es.get("strength_velocity", 0.0)
+        if vel < -0.05:
+            vel_label, vel_color = "VELOCITY  ▼", (220, 70, 50)
+        elif vel > 0.05:
+            vel_label, vel_color = "VELOCITY  ▲", (100, 220, 120)
+        else:
+            vel_label, vel_color = "VELOCITY  —", self.C_LABEL
+        vel_lbl_surf = self.f_sm.render(vel_label, True, vel_color)
+        vel_val_surf = self.f_sm.render(f"{vel:+.2f} u/s", True, self.C_WHITE)
+        self.screen.blit(vel_lbl_surf, (col2_x, ry + 46))
+        self.screen.blit(vel_val_surf,
+                         (col2_x + rw // 2 - vel_val_surf.get_width(), ry + 46))
+        vel_bar = pygame.Rect(col2_x, ry + 64, rw // 2, 8)
+        if vel < -0.05:
+            drop_w = int(vel_bar.width * min(abs(vel) * 5, 1.0))
+            pygame.draw.rect(self.screen, (22, 25, 42), vel_bar, border_radius=3)
+            if drop_w > 0:
+                pygame.draw.rect(self.screen, (200, 55, 40),
+                                 (vel_bar.left, vel_bar.top, drop_w, vel_bar.height),
+                                 border_radius=3)
+        else:
+            _gradient_bar(self.screen, vel_bar, min(abs(vel) * 5, 1.0))
 
     def _hud_row(self, x, y, w, label, value, frac):
         """Labelled metric row with a gradient bar."""
@@ -947,14 +1139,19 @@ class FocusGame:
 
     def _draw_running(self, es: dict):
         self._base_frame()
+        self._tick += 1
 
         self._wave_history.append(es["position"])
-        wave_ys, trail_smooth = self._get_wave_ys()
-        ball_x = int(self.W * self.BALL_X_FRAC)
-        flow = es.get("flow_active", False)
+        mode = self._motion_mode(es)
 
-        self._draw_trail(wave_ys, ball_x, flow)
-        self._draw_ball(wave_ys, es)
+        # Neutral uses low sigma so EEG oscillation is visible as natural wave bumps;
+        # flow uses slightly tighter sigma for crisper booster shape.
+        sigma_map = {"flow": 6.0, "falling": 10.0, "rising": 10.0, "neutral": 3.5}
+        wave_ys, trail_smooth = self._get_wave_ys(sigma=sigma_map[mode])
+        ball_x = int(self.W * self.BALL_X_FRAC)
+
+        self._draw_trail(wave_ys, ball_x, mode, es)
+        self._draw_ball(wave_ys, es, mode)
         self._draw_hud(es)
 
     def _draw_results(self, es: dict):
