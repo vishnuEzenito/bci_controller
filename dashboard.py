@@ -70,10 +70,22 @@ def _sysfont(size, bold=False):
 def _init_gui():
     global screen, FONT, SMALL, TITLE, TINY, BIG, W, H
     import pygame
+    import sys
+
+    # Make DPI-aware on Windows to fix fullscreen scaling issues
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            # Tell Windows this app is DPI-aware
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # PROCESS_SYSTEM_DPI_AWARE
+        except Exception:
+            pass
+
     pygame.init()
     # Pass (0, 0) so pygame picks the native display resolution automatically.
     # Querying display.Info() *before* set_mode can return wrong values on
     # HiDPI / scaled displays, causing content to be cropped in fullscreen.
+    # DPI awareness (set above) ensures pygame gets correct dimensions.
     screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     W, H   = screen.get_width(), screen.get_height()
     pygame.display.set_caption("EEG Dashboard")
