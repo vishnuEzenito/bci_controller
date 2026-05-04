@@ -601,15 +601,18 @@ def _panel(surf, rect, radius=10):
     surf.blit(s, rect.topleft)
 
 
-def _mono_fonts():
-    """Return (xl, lg, md, sm) in a monospace face."""
+def _mono_fonts(height=720):
+    """Return (xl, lg, md, sm) in a monospace face, scaled by screen height."""
+    # Scale factor based on height (720p = 1.0x, 1080p = 1.5x, 1440p = 2.0x, etc.)
+    scale = height / 720.0
     candidates = ["Menlo", "Consolas", "Courier New", "Courier", "monospace"]
     def get(size, bold=False):
+        scaled_size = int(size * scale)
         for name in candidates:
-            f = pygame.font.SysFont(name, size, bold=bold)
+            f = pygame.font.SysFont(name, scaled_size, bold=bold)
             if f:
                 return f
-        return pygame.font.SysFont(None, size, bold=bold)
+        return pygame.font.SysFont(None, scaled_size, bold=bold)
     return get(64, True), get(22, False), get(17), get(13)
 
 
@@ -619,6 +622,7 @@ def _mono_fonts():
 
 class FocusGame:
 
+    # Default resolution (overridden by actual screen size in init)
     W, H = 1280, 720
 
     # Wave history: ~7 sec at 30 fps
@@ -653,19 +657,31 @@ class FocusGame:
             self.eeg_thread = SynthThread(self.processor)
         self.eeg_thread.start()
 
+        # Make DPI-aware on Windows
+        import sys
+        if sys.platform == 'win32':
+            try:
+                import ctypes
+                ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            except Exception:
+                pass
+
         pygame.init()
-        self.screen = pygame.display.set_mode((self.W, self.H))
+        # Use (0, 0) to let pygame auto-detect native resolution in fullscreen
+        self.screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        self.W, self.H = self.screen.get_width(), self.screen.get_height()
         pygame.display.set_caption("FRONTAL NEUROTRAINER · ORBITAL SUITE")
         self.clock = pygame.time.Clock()
 
-        self.f_xl, self.f_lg, self.f_md, self.f_sm = _mono_fonts()
+        # Scale fonts based on actual screen height
+        self.f_xl, self.f_lg, self.f_md, self.f_sm = _mono_fonts(self.H)
 
         self.state = "waiting"
         self.engine_state: dict = {}
 
         self._wave_history: deque = deque([0.5] * self.WAVE_LEN, maxlen=self.WAVE_LEN)
         self._top_strength: int = 0
-        self._fullscreen = False
+        self._fullscreen = True  # Start in fullscreen mode
         self._ball_angle: float = 0.0
         self._grid_surf: pygame.Surface | None = None
         self._paused = False
@@ -1008,6 +1024,8 @@ class FocusGame:
                         # Read actual pixel size back so all layout math is correct
                         self.W, self.H = self.screen.get_size()
                         self._grid_surf = None   # rebuild for new size
+                        # Recreate fonts with new scale
+                        self.f_xl, self.f_lg, self.f_md, self.f_sm = _mono_fonts(self.H)
                     elif event.key == pygame.K_SPACE:
                         if self.state == "waiting":
                             if self.eeg_thread.get_latest() is not None:
