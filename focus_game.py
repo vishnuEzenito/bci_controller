@@ -801,28 +801,37 @@ class FocusGame:
 
         self._ball_angle += es.get("velocity", 0.0) * 15.0
 
+        # Scale ball size based on screen height (720p baseline = 1.0x)
+        scale = self.H / 720.0
+        ball_radius = int(12 * scale * 1.5)  # 1.5x larger than original
+        glow_max = int(38 * scale * 1.5)
+        glow_min = int(8 * scale * 1.5)
+        glow_step = int(6 * scale * 1.5)
+        spiral_max_r = int(9 * scale * 1.5)
+
         # Outer glow layers
         glow_color = (64, 224, 208) if flow else (200, 215, 255)
-        for r in range(38, 8, -6):
-            alpha = int(6 + 22 * strength * ((38 - r) / 30))
+        for r in range(glow_max, glow_min, -max(1, glow_step)):
+            alpha = int(6 + 22 * strength * ((glow_max - r) / (glow_max - glow_min + 1)))
             g = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
             pygame.draw.circle(g, (*glow_color, alpha), (r, r), r)
             self.screen.blit(g, (ball_x - r, ball_y - r))
 
         # Solid white ball
-        pygame.draw.circle(self.screen, self.C_WHITE, (ball_x, ball_y), 12)
+        pygame.draw.circle(self.screen, self.C_WHITE, (ball_x, ball_y), ball_radius)
 
         # Rotating Archimedean spiral etched into the ball
         spiral_pts = []
-        turns, steps, max_r = 1.8, 42, 9
+        turns, steps = 1.8, 42
         for i in range(steps + 1):
             t = i / steps
             theta = t * turns * 2 * math.pi + self._ball_angle
-            r = t * max_r
+            r = t * spiral_max_r
             spiral_pts.append((int(ball_x + r * math.cos(theta)),
                                 int(ball_y + r * math.sin(theta))))
         if len(spiral_pts) > 1:
-            pygame.draw.lines(self.screen, self.C_BG, False, spiral_pts, 1)
+            line_width = max(1, int(1 * scale))
+            pygame.draw.lines(self.screen, self.C_BG, False, spiral_pts, line_width)
 
     # ── HUD layout ────────────────────────────────────────────────────────────
 
